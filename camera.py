@@ -1,24 +1,17 @@
 import cv2
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_FPS,          30)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
+if not cap.isOpened():
+    raise RuntimeError("Не удалось открыть камеру")
 
 def get_frame():
     ret, frame = cap.read()
-    if not ret:
-        return None
-    return frame
-
-def draw_fps(frame, fps):
-    cv2.putText(frame,
-                f'FPS: {fps:.1f}',
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2)
-
-def show_frame(frame):
-    cv2.imshow("SaveWalk AI", frame)
+    return frame if ret else None
 
 def release():
     cap.release()

@@ -1,70 +1,82 @@
 import time
+import logging
 import cv2
 
-from camera import get_frame, show_frame, release, draw_fps
-from detection import detect
-from distance import get_distance
-from voice import speak
+from camera        import get_frame, release
+from detection     import detect
+from distance      import raw_distance
+from sound_manager import SoundManager
 
-# Расстояние (в метрах) при котором включается голосовое оповещение
-ALERT_DISTANCE = 3.0
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
-print("SaveWalk AI запущен. Нажмите 'Q' для выхода.")
+# YOLO запускается раз в N кадров.
+# 1 = каждый кадр (точнее, медленнее)
+# 2 = через кадр (+35-40% FPS)
+YOLO_EVERY_N = 2
+
+sound_mgr   = SoundManager()
+frame_count = 0
+prev_dets   = []
+t_prev      = time.monotonic()
+
+print("SaveWalk AI запущен. Нажми Q для выхода.")
 
 while True:
-    start_time = time.time()
-
     frame = get_frame()
     if frame is None:
-        print("Ошибка: камера не даёт изображение.")
+        print("Камера не отвечает.")
         break
 
-    detections = detect(frame)
+    frame_count += 1
+
+    if frame_count % YOLO_EVERY_N == 0:
+        prev_dets = detect(frame)
+
+    detections = prev_dets
+    active_ids = set()
 
     for obj in detections:
-        label = obj["label"]
-        box = obj["box"]
-        conf = obj["conf"]
+        track_id = obj["track_id"]
+        label    = obj["label"]
+        box      = obj["box"]
+        conf     = obj["conf"]
 
+        if track_id is not None:
+            active_ids.add(track_id)
+
+        dist = raw_distance(label, box)
+
+        # вся логика антиспама, сглаживания и озвучки — внутри process()
+        sound_mgr.process(track_id, label, dist)
+
+        # отрисовка
         x1, y1, x2, y2 = box
+        dist_str  = f"{dist:.1f}m" if dist else "?m"
+        color     = (0, 0, 255) if (dist and dist < 4.0) else (0, 200, 0)
+        label_str = f"{label} #{track_id}  {dist_str}  {conf:.0%}"
 
-        distance = get_distance(label, box)
-
-        # Цвет рамки: красный если близко, зелёный если далеко
-        color = (0, 0, 255) if (distance and distance < ALERT_DISTANCE) else (0, 255, 0)
-
-        # Рисуем bounding box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        (tw, th), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+        cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(frame, label_str, (x1 + 3, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
 
-        # Текст: название + дистанция + уверенность
-        if distance:
-            text = f"{label} {distance}m ({conf:.0%})"
-        else:
-            text = f"{label} ({conf:.0%})"
+    sound_mgr.tick_missing(active_ids)
 
-        # Фон под текстом для читаемости
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        cv2.rectangle(frame, (x1, y1 - th - 14), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(frame,
-                    text,
-                    (x1 + 2, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2)
+    now    = time.monotonic()
+    fps    = 1.0 / (now - t_prev + 1e-9)
+    t_prev = now
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
-        # Голосовое оповещение если объект близко
-        if distance and distance < ALERT_DISTANCE:
-            speak(label, distance)
+    cv2.imshow("SaveWalk AI", frame)
 
-    # FPS
-    fps = 1.0 / (time.time() - start_time + 1e-6)
-    draw_fps(frame, fps)
-
-    show_frame(frame)
-
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
 release()
-print("Программа завершена.")
+print("Завершено.")
