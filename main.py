@@ -2,53 +2,51 @@ import time
 import logging
 import cv2
 
-from camera         import get_frame, release
-from detection      import detect
-from distance       import estimate_distance
-from sound_manager  import SoundManager
-from traffic_light  import detect_traffic_light_color
+from camera                      import get_frame, release
+from core.detector               import detect
+from core.distance               import estimate_distance
+from core.tracker                import DistanceSmoother, MotionTracker, get_direction
+from core.traffic_light          import detect_color
+from services.danger_service     import calc_risk, pick_top_threat
+from services.navigation_service import navigation_hint
+from services.sound_service      import SoundService
+from sound_manager               import SoundManager
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+log = logging.getLogger(__name__)
 
+# ─── Настройки ────────────────────────────────────────────────────────────────
 YOLO_EVERY_N  = 2
 DANGER_DIST_M = 3.0
 
-# Цвет рамки светофора по цвету сигнала
 TL_BOX_COLOR = {
     "red":    (0,   0,   255),
     "green":  (0,   200, 0),
     "yellow": (0,   200, 255),
-    None:     (200, 200, 200),
+    None:     (180, 180, 180),
 }
 
-# Звуковые файлы светофора
-TL_SOUND = {
-    "red":    r"sounds\traffic light\red.wav",
-    "green":  r"sounds\traffic light\green.wav",
-    "yellow": r"sounds\traffic light\yellow.wav",
-}
+# ─── Инициализация ────────────────────────────────────────────────────────────
+sound_mgr  = SoundManager()
+sound_svc  = SoundService(sound_mgr)
+smoother   = DistanceSmoother()
+motion_trk = MotionTracker()
 
-# Антиспам: не повторять один и тот же цвет светофора чаще чем раз в N секунд
-TL_REPEAT_INTERVAL = 5.0
-
-# track_id → (последний цвет, время последнего звука)
-tl_last: dict[int, tuple[str, float]] = {}
-
-sound_mgr   = SoundManager()
 frame_count = 0
 prev_dets   = []
 t_prev      = time.monotonic()
 
-print("SaveWalk AI запущен. Нажми Q для выхода.")
+print("SaveWalk AI v2.0 запущен. Нажми Q для выхода.")
 
+# ─── Главный цикл ─────────────────────────────────────────────────────────────
 while True:
     frame = get_frame()
     if frame is None:
-        logging.warning("Камера не отвечает.")
+        log.warning("Камера не отвечает.")
         break
 
     frame_count += 1
@@ -56,57 +54,64 @@ while True:
     if frame_count % YOLO_EVERY_N == 0:
         prev_dets = detect(frame)
 
-    active_ids = set()
+    active_ids    = set()
+    enriched_objs = []
+    tl_objects    = []
 
+    # ── Обогащение детекций ───────────────────────────────────────────────────
     for obj in prev_dets:
         track_id = obj["track_id"]
         label    = obj["label"]
         box      = obj["box"]
-        conf     = obj["conf"]
 
         if track_id is not None:
             active_ids.add(track_id)
 
-        x1, y1, x2, y2 = box
-
-        # ── Светофор ──────────────────────────────────────────────────────────
+        # Светофор — отдельная ветка
         if label == "traffic light":
-            tl_color = detect_traffic_light_color(frame, box)
-
-            # Звук — только если цвет изменился или прошло TL_REPEAT_INTERVAL
-            if tl_color is not None and track_id is not None:
-                last_color, last_time = tl_last.get(track_id, (None, 0.0))
-                now = time.monotonic()
-                color_changed = tl_color != last_color
-                time_ok       = (now - last_time) >= TL_REPEAT_INTERVAL
-
-                if color_changed or time_ok:
-                    sound_path = TL_SOUND.get(tl_color)
-                    if sound_path:
-                        sound_mgr.play_file(sound_path)
-                        logging.info(f"[СВЕТОФОР] #{track_id}  цвет={tl_color}  → {sound_path}")
-                    tl_last[track_id] = (tl_color, now)
-
-            # Отрисовка светофора
-            color     = TL_BOX_COLOR.get(tl_color, TL_BOX_COLOR[None])
-            color_str = tl_color if tl_color else "?"
-            label_str = f"traffic light #{track_id}  [{color_str}]  {conf:.0%}"
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            (tw, th), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
-            cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
-            cv2.putText(frame, label_str, (x1 + 3, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+            tl_objects.append(obj)
             continue
 
-        # ── Остальные объекты (person, car, ...) ─────────────────────────────
-        dist = estimate_distance(label, box)
-        sound_mgr.process(track_id, label, dist)
+        raw_dist = estimate_distance(label, box)
+        if raw_dist is None:
+            continue
 
-        dist_str  = f"{dist:.1f}m" if dist is not None else "?m"
-        is_danger = dist is not None and dist < DANGER_DIST_M
-        color     = (0, 0, 255) if is_danger else (0, 200, 0)
-        label_str = f"{label} #{track_id}  {dist_str}  {conf:.0%}"
+        dist      = smoother.update(track_id, raw_dist) if track_id else raw_dist
+        direction = get_direction(box)
+        motion    = motion_trk.update(track_id, dist) if track_id else "stable"
+        risk      = calc_risk(label, dist, motion)
+
+        enriched_objs.append({
+            **obj,
+            "dist":      dist,
+            "direction": direction,
+            "motion":    motion,
+            "risk":      risk,
+        })
+
+        log.info(
+            "%s #%s | dist=%.2f | dir=%s | motion=%s | risk=%.1f",
+            label, track_id, dist, direction, motion, risk,
+        )
+
+    # ── Звук: только самый опасный объект ─────────────────────────────────────
+    top_threat = pick_top_threat(enriched_objs)
+    sound_svc.process_threat(top_threat, enriched_objs)
+
+    # Навигационная подсказка в лог
+    hint = navigation_hint(enriched_objs, top_threat)
+    if hint:
+        log.info("[NAV] %s", hint)
+
+    # ── Светофоры ─────────────────────────────────────────────────────────────
+    for tl in tl_objects:
+        tl_color = detect_color(frame, tl["box"])
+        sound_svc.process_traffic_light(tl["track_id"], tl_color)
+
+        x1, y1, x2, y2 = tl["box"]
+        color     = TL_BOX_COLOR.get(tl_color, TL_BOX_COLOR[None])
+        color_str = tl_color or "?"
+        label_str = f"TL #{tl['track_id']} [{color_str}] {tl['conf']:.0%}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         (tw, th), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
@@ -114,15 +119,50 @@ while True:
         cv2.putText(frame, label_str, (x1 + 3, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
 
-    sound_mgr.tick_missing(active_ids)
+    # ── Отрисовка объектов ────────────────────────────────────────────────────
+    for obj in enriched_objs:
+        x1, y1, x2, y2 = obj["box"]
+        dist      = obj["dist"]
+        is_top    = top_threat and obj["track_id"] == top_threat["track_id"]
+        is_danger = dist < DANGER_DIST_M
 
+        # Рамка: белая для top_threat, красная/зелёная для остальных
+        if is_top:
+            color = (255, 255, 255)
+        elif is_danger:
+            color = (0, 0, 255)
+        else:
+            color = (0, 200, 0)
+
+        label_str = (
+            f"{obj['label']} #{obj['track_id']}  "
+            f"{dist:.1f}m {obj['direction']} "
+            f"{obj['motion']}  r={obj['risk']:.0f}"
+        )
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        (tw, th), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
+        cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
+        cv2.putText(frame, label_str, (x1 + 3, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
+
+    # Навигационная подсказка на экране
+    if hint:
+        cv2.putText(frame, hint, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
+
+    # ── Тик + cleanup ─────────────────────────────────────────────────────────
+    sound_mgr.tick_missing(active_ids)
+    smoother.cleanup(active_ids)
+    motion_trk.cleanup(active_ids)
+
+    # FPS
     now    = time.monotonic()
     fps    = 1.0 / (now - t_prev + 1e-9)
     t_prev = now
     cv2.putText(frame, f"FPS: {fps:.1f}", (10, 28),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
 
-    cv2.imshow("SaveWalk AI", frame)
+    cv2.imshow("SaveWalk AI v2.0", frame)
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
