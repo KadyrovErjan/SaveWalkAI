@@ -77,34 +77,15 @@ def _play_blocking(path: str, done_cb):
 
 # ─── DistanceSmoother ─────────────────────────────────────────────────────────
 
-HYSTERESIS = 0.15   # зона нечувствительности при снижении bucket
+HYSTERESIS = 0.15
 
 class DistanceSmoother:
-    """
-    Moving average + bucket логика с hysteresis.
-
-    Таблица bucket (используем int(), а НЕ round()):
-      0.0 – 0.99  →  bucket 0  (менее 1 метра, не озвучиваем)
-      1.0 – 1.99  →  bucket 1  ("1 метр")
-      2.0 – 2.99  →  bucket 2  ("2 метра")
-      ...
-
-    Hysteresis:
-      Вошли в bucket=1 при smoothed=1.0
-      Выходим обратно в bucket=0 только если smoothed < 1.0 - 0.15 = 0.85
-      Это убирает дребезг: 0.95 → 1.05 → 0.98 → не вызывает повторных срабатываний
-    """
-
     def __init__(self, window: int = 5):
         self._window      = window
-        self._bufs        = {}   # track_id -> deque[float]
-        self._last_bucket = {}   # track_id -> int
+        self._bufs        = {}
+        self._last_bucket = {}
 
     def update(self, track_id: int, raw: float):
-        """
-        Возвращает (smoothed: float, bucket: int, changed: bool).
-        changed=True только при реальном переходе bucket с учётом hysteresis.
-        """
         if track_id not in self._bufs:
             self._bufs[track_id] = deque(maxlen=self._window)
 
@@ -112,7 +93,6 @@ class DistanceSmoother:
         smoothed = sum(self._bufs[track_id]) / len(self._bufs[track_id])
         prev     = self._last_bucket.get(track_id)
 
-        # Первое появление — инициализируем без озвучки
         if prev is None:
             bucket = int(smoothed)
             self._last_bucket[track_id] = bucket
@@ -121,10 +101,8 @@ class DistanceSmoother:
         candidate = int(smoothed)
 
         if candidate > prev:
-            # Приближение: переходим вверх сразу (int() уже правильный порог)
             new_bucket = candidate
         elif candidate < prev:
-            # Удаление: переходим вниз только с отступом HYSTERESIS
             if smoothed < (prev - HYSTERESIS):
                 new_bucket = candidate
             else:
@@ -151,19 +129,6 @@ class DistanceSmoother:
 # ─── SoundManager ─────────────────────────────────────────────────────────────
 
 class SoundManager:
-    """
-    Единая точка управления звуком.
-
-    Условия воспроизведения (ВСЕ должны выполняться):
-      [1] label в TRIGGER_CLASSES
-      [2] smoothed < MAX_DIST_M
-      [3] bucket > 0 (иначе молчим — "менее 1 метра")
-      [4] объект стабилен >= STABLE_FRAMES кадров подряд
-      [5] bucket изменился (или объект вернулся после RETRIGGER_AFTER сек)
-      [6] cooldown прошёл
-      [7] сейчас не играет другой звук
-    """
-
     TRIGGER_CLASSES = {"person"}
     MAX_DIST_M      = 5.0
     STABLE_FRAMES   = 3
@@ -177,63 +142,79 @@ class SoundManager:
         self._lock    = threading.Lock()
         self._playing = False
 
-        self._last_played  = {}   # track_id -> float (monotonic)
-        self._last_bucket  = {}   # track_id -> int
-        self._last_seen    = {}   # track_id -> float (monotonic)
-        self._consec       = {}   # track_id -> int (кадров подряд)
-        self._missing      = {}   # track_id -> int (кадров отсутствия)
+        self._last_played  = {}
+        self._last_bucket  = {}
+        self._last_seen    = {}
+        self._consec       = {}
+        self._missing      = {}
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # НОВЫЙ МЕТОД: прямое воспроизведение любого wav-файла (для светофора и др.)
+    # Не блокирует main loop, не мешает звукам person.
+    # ──────────────────────────────────────────────────────────────────────────
+    def play_file(self, path: str):
+        """
+        Воспроизводит wav по прямому пути без антиспама и bucket-логики.
+        Используется для светофора: play_file("sounds/traffic light/red.wav")
+        Если сейчас уже играет другой звук — ждёт своей очереди.
+        """
+        if not os.path.exists(path):
+            log.warning("[play_file] Файл не найден: %s", path)
+            return
+
+        def _worker():
+            # Ждём пока освободится канал (не бесконечно — макс 3 сек)
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if not self._playing:
+                        self._playing = True
+                        break
+                time.sleep(0.05)
+            else:
+                log.debug("[play_file] Пропущен (канал занят): %s", path)
+                return
+
+            log.info("[СВЕТОФОР] ▶ %s", path)
+            _play_blocking(path, self._on_done)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────────────────
 
     def process(self, track_id, label, raw_distance):
-        """
-        Вызывается из main loop для каждого детектированного объекта.
-        Внутри сам решает: обновить состояние / озвучить / пропустить.
-        """
         if track_id is None or raw_distance is None:
             return
 
         now = time.monotonic()
 
-        # Обновляем стабильность
         self._missing[track_id]   = 0
         self._consec[track_id]    = self._consec.get(track_id, 0) + 1
         self._last_seen[track_id] = now
 
-        # Сглаживание + bucket
         smoothed, bucket, bucket_changed = self.smoother.update(track_id, raw_distance)
 
-        # [1] нужный класс
         if label not in self.TRIGGER_CLASSES:
             return
-
-        # [2] в зоне оповещения
         if smoothed >= self.MAX_DIST_M:
             return
-
-        # [3] bucket 0 = "менее 1 метра" — молчим
         if bucket == 0:
             return
-
-        # [4] объект нестабильный (накапливаем кадры)
         if self._consec[track_id] < self.STABLE_FRAMES:
             return
 
-        # Retrigger: объект вернулся после долгого отсутствия → сбрасываем last_bucket
         gap = now - self._last_played.get(track_id, 0)
         if gap >= self.RETRIGGER_AFTER:
             self._last_bucket.pop(track_id, None)
             bucket_changed = True
 
-        # [5] bucket не изменился
         if not bucket_changed:
             return
         if self._last_bucket.get(track_id) == bucket:
             return
-
-        # [6] cooldown
         if now - self._last_played.get(track_id, 0) < self.COOLDOWN_SEC:
             return
 
-        # [7] наложение: другой звук уже играет
         with self._lock:
             if self._playing:
                 return
@@ -256,10 +237,6 @@ class SoundManager:
         ).start()
 
     def tick_missing(self, active_ids: set):
-        """
-        Обновляет счётчики отсутствия для объектов которые пропали из кадра.
-        Вызывай ПОСЛЕ обработки всех детекций в кадре.
-        """
         for tid in list(self._consec):
             if tid not in active_ids:
                 self._missing[tid] = self._missing.get(tid, 0) + 1
@@ -267,7 +244,6 @@ class SoundManager:
                     self._consec.pop(tid, None)
                     self._missing.pop(tid, None)
 
-        # Полная чистка давно исчезнувших треков
         threshold = time.monotonic() - self.RETRIGGER_AFTER * 3
         for tid in list(self._last_seen):
             if self._last_seen[tid] < threshold and tid not in active_ids:
