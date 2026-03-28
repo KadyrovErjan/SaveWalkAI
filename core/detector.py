@@ -7,6 +7,7 @@ TRACKED_CLASSES = {
     "train", "bus", "motorcycle", "bicycle",
 }
 
+
 def detect(frame):
     """Запускает YOLO + ByteTrack, возвращает список объектов."""
     results = model.track(
