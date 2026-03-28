@@ -8,9 +8,7 @@ from core.distance               import estimate_distance
 from core.tracker                import DistanceSmoother, MotionTracker, get_direction
 from core.traffic_light          import detect_color
 from services.danger_service     import calc_risk, pick_top_threat
-from services.navigation_service import navigation_hint
 from services.sound_service      import SoundService
-from sound_manager               import SoundManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,7 +17,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Настройки ────────────────────────────────────────────────────────────────
 YOLO_EVERY_N  = 2
 DANGER_DIST_M = 3.0
 
@@ -30,9 +27,7 @@ TL_BOX_COLOR = {
     None:     (180, 180, 180),
 }
 
-# ─── Инициализация ────────────────────────────────────────────────────────────
-sound_mgr  = SoundManager()
-sound_svc  = SoundService(sound_mgr)
+sound_svc  = SoundService()
 smoother   = DistanceSmoother()
 motion_trk = MotionTracker()
 
@@ -42,7 +37,6 @@ t_prev      = time.monotonic()
 
 print("SaveWalk AI v2.0 запущен. Нажми Q для выхода.")
 
-# ─── Главный цикл ─────────────────────────────────────────────────────────────
 while True:
     frame = get_frame()
     if frame is None:
@@ -50,7 +44,6 @@ while True:
         break
 
     frame_count += 1
-
     if frame_count % YOLO_EVERY_N == 0:
         prev_dets = detect(frame)
 
@@ -58,7 +51,6 @@ while True:
     enriched_objs = []
     tl_objects    = []
 
-    # ── Обогащение детекций ───────────────────────────────────────────────────
     for obj in prev_dets:
         track_id = obj["track_id"]
         label    = obj["label"]
@@ -67,7 +59,6 @@ while True:
         if track_id is not None:
             active_ids.add(track_id)
 
-        # Светофор — отдельная ветка
         if label == "traffic light":
             tl_objects.append(obj)
             continue
@@ -89,29 +80,21 @@ while True:
             "risk":      risk,
         })
 
-        log.info(
-            "%s #%s | dist=%.2f | dir=%s | motion=%s | risk=%.1f",
-            label, track_id, dist, direction, motion, risk,
-        )
+        log.info("%s #%s | dist=%.2f | dir=%s | motion=%s | risk=%.1f",
+                 label, track_id, dist, direction, motion, risk)
 
-    # ── Звук: только самый опасный объект ─────────────────────────────────────
+    # ── Навигационный звук ────────────────────────────────────────────────────
     top_threat = pick_top_threat(enriched_objs)
-    sound_svc.process_threat(top_threat, enriched_objs)
-
-    # Навигационная подсказка в лог
-    hint = navigation_hint(enriched_objs, top_threat)
-    if hint:
-        log.info("[NAV] %s", hint)
+    sound_svc.update(enriched_objs, top_threat)   # ← один вызов, вся логика внутри
 
     # ── Светофоры ─────────────────────────────────────────────────────────────
     for tl in tl_objects:
         tl_color = detect_color(frame, tl["box"])
-        sound_svc.process_traffic_light(tl["track_id"], tl_color)
+        sound_svc.traffic_light(tl["track_id"], tl_color)
 
         x1, y1, x2, y2 = tl["box"]
         color     = TL_BOX_COLOR.get(tl_color, TL_BOX_COLOR[None])
-        color_str = tl_color or "?"
-        label_str = f"TL #{tl['track_id']} [{color_str}] {tl['conf']:.0%}"
+        label_str = f"TL #{tl['track_id']} [{tl_color or '?'}] {tl['conf']:.0%}"
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         (tw, th), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
@@ -122,40 +105,26 @@ while True:
     # ── Отрисовка объектов ────────────────────────────────────────────────────
     for obj in enriched_objs:
         x1, y1, x2, y2 = obj["box"]
-        dist      = obj["dist"]
-        is_top    = top_threat and obj["track_id"] == top_threat["track_id"]
-        is_danger = dist < DANGER_DIST_M
+        dist   = obj["dist"]
+        is_top = top_threat and obj["track_id"] == top_threat["track_id"]
 
-        # Рамка: белая для top_threat, красная/зелёная для остальных
-        if is_top:
-            color = (255, 255, 255)
-        elif is_danger:
-            color = (0, 0, 255)
-        else:
-            color = (0, 200, 0)
+        color = (255, 255, 255) if is_top else \
+                (0, 0, 255)     if dist < DANGER_DIST_M else \
+                (0, 200, 0)
 
-        label_str = (
-            f"{obj['label']} #{obj['track_id']}  "
-            f"{dist:.1f}m {obj['direction']} "
-            f"{obj['motion']}  r={obj['risk']:.0f}"
-        )
+        label_str = (f"{obj['label']} #{obj['track_id']}  "
+                     f"{dist:.1f}m {obj['direction']} "
+                     f"{obj['motion']}  r={obj['risk']:.0f}")
+
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         (tw, th), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 2)
         cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 6, y1), color, -1)
         cv2.putText(frame, label_str, (x1 + 3, y1 - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
 
-    # Навигационная подсказка на экране
-    if hint:
-        cv2.putText(frame, hint, (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2)
-
-    # ── Тик + cleanup ─────────────────────────────────────────────────────────
-    sound_mgr.tick_missing(active_ids)
     smoother.cleanup(active_ids)
     motion_trk.cleanup(active_ids)
 
-    # FPS
     now    = time.monotonic()
     fps    = 1.0 / (now - t_prev + 1e-9)
     t_prev = now

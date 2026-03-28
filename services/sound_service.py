@@ -1,216 +1,296 @@
 """
-SoundService v2.0
------------------
-Логика воспроизведения звуков для SaveWalk AI.
+SoundService v4.0 — Навигационный ассистент
+--------------------------------------------
+Принцип: не описывать объекты, а помогать двигаться.
 
-Правила:
-  1. Только один объект озвучивается за раз (top_threat).
-  2. Высокий риск → только alert, остальное пропускается.
-  3. Звуки объекта воспроизводятся последовательно через очередь:
-       direction → dist → motion
-  4. Cooldown на track_id: один объект не чаще раз в COOLDOWN_SEC.
-  5. Навигация: если top_threat по центру и близко → go_left / go_right.
-  6. Никаких time.sleep — всё через threading + очередь.
+Логика решений:
+  STOP      → объект ближе VERY_CLOSE_M (любой класс)
+  DANGER    → машина/мотоцикл приближается < DANGER_DIST_M
+  PERSON    → человек по центру + approaching → person_ahead → обход
+  NAVIGATE  → объект по центру → left.wav / right.wav (свободная сторона)
+  GO        → путь свободен → go.wav (не чаще раза в GO_INTERVAL сек)
+
+Приоритет сигналов (сверху вниз, первый подходящий):
+  1. stop / very_close    — немедленная опасность
+  2. car / bus / moto     — транспорт приближается
+  3. person_ahead         — человек по центру
+  4. navigate (обход)     — предложить сторону
+  5. go                   — путь свободен
 """
 
 import os
 import time
-import queue
 import threading
 import logging
 
 log = logging.getLogger(__name__)
 
-# ─── Пути к звукам ────────────────────────────────────────────────────────────
+# ─── Пути ─────────────────────────────────────────────────────────────────────
+SOUNDS_DIR = "sounds"
 
-SOUNDS = "sounds"
+def _s(*parts) -> str | None:
+    p = os.path.join(SOUNDS_DIR, *parts)
+    return p if os.path.exists(p) else None
 
-def _p(*parts) -> str:
-    """Собирает путь и возвращает только если файл существует."""
-    path = os.path.join(SOUNDS, *parts)
-    return path if os.path.exists(path) else None
+# Все звуки навигации
+class S:
+    GO           = _s("system", "go.wav")
+    STOP         = _s("system", "stop.wav")
+    LEFT         = _s("system", "left.wav")
+    RIGHT        = _s("system", "right.wav")
+    VERY_CLOSE   = _s("system", "very_close.wav")
+    PERSON_AHEAD = _s("system", "person_ahead.wav")
+    OBSTACLE     = _s("system", "obstacle.wav")
+    NO_WAY       = _s("system", "no_way.wav")
 
-
-def _dist_file(label: str, dist: float) -> str | None:
-    """sounds/<label>/dist/N.wav — N = 1..5 по округлению."""
-    bucket = max(1, min(5, int(dist)))
-    return _p(label, "dist", f"{bucket}.wav")
-
+    TL_RED       = _s("traffic light", "red.wav")
+    TL_GREEN     = _s("traffic light", "green.wav")
+    TL_YELLOW    = _s("traffic light", "yellow.wav")
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 
-COOLDOWN_SEC    = 2.5    # один track_id не чаще раз в N сек
-HIGH_RISK_SCORE = 15.0   # выше этого → только alert, без остального
-NAV_DIST_M      = 2.5    # ближе этого + центр → навигационная подсказка
+VERY_CLOSE_M  = 1.0    # ближе → немедленный stop
+DANGER_DIST_M = 2.5    # транспорт ближе → danger
+PERSON_DIST_M = 2.0    # человек по центру ближе → person_ahead
+NAV_DIST_M    = 3.5    # объект по центру ближе → предложить обход
 
-# Звуки светофора
-TL_SOUND = {
-    "red":    _p("traffic light", "red.wav"),
-    "green":  _p("traffic light", "green.wav"),
-    "yellow": _p("traffic light", "yellow.wav"),
-}
-TL_COOLDOWN_SEC = 5.0
+COOLDOWN_SEC  = 2.5    # минимальный интервал между любыми звуками
+GO_INTERVAL   = 5.0    # "go" не чаще раза в N сек
+TL_COOLDOWN   = 5.0    # светофор не чаще раза в N сек
+
+# Транспорт — высокая опасность
+TRANSPORT = {"car", "bus", "motorcycle", "bicycle", "train"}
+
+# Всё что является препятствием
+OBSTACLES = {"car", "bus", "motorcycle", "bicycle", "train", "person", "stop sign"}
+
+# ─── Аудио бэкенд ─────────────────────────────────────────────────────────────
+
+def _build_play_fn():
+    try:
+        import simpleaudio as sa
+        def play(path):
+            sa.WaveObject.from_wave_file(path).play().wait_done()
+        log.info("Аудио: simpleaudio")
+        return play
+    except ImportError:
+        pass
+    try:
+        import pygame
+        pygame.mixer.init(frequency=44100, size=-16, channels=1, buffer=512)
+        def play(path):
+            snd = pygame.mixer.Sound(path)
+            ch  = snd.play()
+            while ch.get_busy():
+                time.sleep(0.02)
+        log.info("Аудио: pygame")
+        return play
+    except ImportError:
+        pass
+    try:
+        import winsound
+        def play(path):
+            winsound.PlaySound(path, winsound.SND_FILENAME)
+        log.info("Аудио: winsound")
+        return play
+    except ImportError:
+        pass
+    log.warning("Аудио бэкенд не найден")
+    return None
+
+_PLAY_FN = _build_play_fn()
 
 
-# ─── Очередь последовательного воспроизведения ────────────────────────────────
+class _Player:
+    """Один звук в один момент времени. Не блокирует main loop."""
 
-class _SequentialPlayer:
-    """
-    Принимает список wav-файлов и воспроизводит их один за другим
-    через sound_manager.play_file(), не блокируя main loop.
-    """
+    def __init__(self):
+        self._lock    = threading.Lock()
+        self._playing = False
 
-    def __init__(self, sound_manager):
-        self._mgr   = sound_manager
-        self._queue: queue.Queue = queue.Queue()
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return self._playing
 
-    def play_sequence(self, paths: list[str]):
-        """Добавить новую последовательность (старая прерывается через очистку)."""
-        # Чистим предыдущую очередь — новый объект важнее
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-            except queue.Empty:
-                break
-        for p in paths:
-            if p:  # None-пути пропускаем
-                self._queue.put(p)
+    def play(self, path: str) -> bool:
+        if not path or not os.path.exists(path):
+            log.debug("[player] файл не найден: %s", path)
+            return False
+        with self._lock:
+            if self._playing or _PLAY_FN is None:
+                return False
+            self._playing = True
+        threading.Thread(target=self._worker, args=(path,), daemon=True).start()
+        return True
 
-    def _worker(self):
-        while True:
-            path = self._queue.get()   # блокирует до появления задачи
-            if not os.path.exists(path):
-                log.debug("[sound] файл не найден: %s", path)
-                continue
-            # play_file сам ждёт освобождения канала
-            self._mgr.play_file(path)
-            # Небольшая пауза между звуками в последовательности
-            time.sleep(0.15)
+    def _worker(self, path):
+        try:
+            _PLAY_FN(path)
+        except Exception as e:
+            log.error("Ошибка воспроизведения %s: %s", path, e)
+        finally:
+            with self._lock:
+                self._playing = False
 
 
 # ─── SoundService ─────────────────────────────────────────────────────────────
 
 class SoundService:
+    """
+    Навигационный ассистент звука.
 
-    def __init__(self, sound_manager):
-        self._mgr     = sound_manager
-        self._player  = _SequentialPlayer(sound_manager)
+    Использование в main.py:
+        sound_svc = SoundService()
 
-        # Антиспам: track_id → время последнего воспроизведения
-        self._last_played:  dict[int, float] = {}
-        # Светофор: track_id → (color, time)
-        self._tl_last: dict[int, tuple[str, float]] = {}
+        # каждый кадр:
+        sound_svc.update(enriched_objs, top_threat)
 
-    # ── Публичный API ─────────────────────────────────────────────────────────
+        # для светофора:
+        sound_svc.traffic_light(track_id, color)
+    """
 
-    def process_threat(self, top_threat: dict | None, all_objects: list[dict]):
+    def __init__(self):
+        self._player     = _Player()
+        self._last_sound: str | None = None        # последний сыгранный файл
+        self._last_time:  float      = 0.0         # время последнего звука
+        self._last_go:    float      = 0.0         # время последнего "go"
+        self._tl_state:   dict       = {}           # track_id → (color, time)
+
+    # ── Главный метод — вызывать каждый кадр ─────────────────────────────────
+
+    def update(self, all_objects: list[dict], top_threat: dict | None):
         """
-        Главный метод — вызывать из main loop для каждого кадра.
-        top_threat — результат pick_top_threat().
-        all_objects — все enriched объекты (для навигации).
+        all_objects — все enriched объекты кадра (для определения свободных сторон).
+        top_threat  — результат pick_top_threat() — самый опасный объект.
         """
-        if top_threat is None:
-            return
-
-        track_id = top_threat.get("track_id")
-        if track_id is None:
-            return
-
-        # Cooldown
         now = time.monotonic()
-        if now - self._last_played.get(track_id, 0) < COOLDOWN_SEC:
+
+        # Глобальный cooldown — не чаще COOLDOWN_SEC
+        if now - self._last_time < COOLDOWN_SEC:
             return
 
-        sequence = self._build_sequence(top_threat, all_objects)
-        if not sequence:
+        # Канал занят — ждём
+        if self._player.busy:
             return
 
-        self._last_played[track_id] = now
-        log.info(
-            "[SOUND] %s #%d | risk=%.1f | seq=%s",
-            top_threat["label"], track_id,
-            top_threat.get("risk", 0),
-            [os.path.basename(p) for p in sequence],
-        )
-        self._player.play_sequence(sequence)
+        sound = self._decide(all_objects, top_threat, now)
+        if sound is None:
+            return
 
-    def process_traffic_light(self, track_id: int | None, tl_color: str | None):
+        # Не повторять тот же звук подряд (кроме stop — он всегда важен)
+        if sound == self._last_sound and sound != S.STOP:
+            return
+
+        if self._player.play(sound):
+            self._last_sound = sound
+            self._last_time  = now
+            if sound == S.GO:
+                self._last_go = now
+            log.info("[NAV] %s", os.path.basename(sound))
+
+    # ── Светофор ──────────────────────────────────────────────────────────────
+
+    def traffic_light(self, track_id: int | None, color: str | None):
         """Озвучивает светофор при смене цвета или по таймеру."""
-        if tl_color is None or track_id is None:
+        if color is None or track_id is None:
             return
 
-        last_color, last_time = self._tl_last.get(track_id, (None, 0.0))
         now = time.monotonic()
+        last_color, last_time = self._tl_state.get(track_id, (None, 0.0))
 
-        if tl_color == last_color and (now - last_time) < TL_COOLDOWN_SEC:
+        if color == last_color and (now - last_time) < TL_COOLDOWN:
             return
 
-        path = TL_SOUND.get(tl_color)
-        if path:
-            self._mgr.play_file(path)
-            log.info("[СВЕТОФОР] #%d  %s", track_id, tl_color)
-        self._tl_last[track_id] = (tl_color, now)
+        path = {
+            "red":    S.TL_RED,
+            "green":  S.TL_GREEN,
+            "yellow": S.TL_YELLOW,
+        }.get(color)
 
-    # ── Построение последовательности ────────────────────────────────────────
+        if self._player.play(path):
+            self._tl_state[track_id] = (color, now)
+            self._last_time = now
+            log.info("[TL] #%d %s", track_id, color)
 
-    def _build_sequence(self, obj: dict, all_objects: list[dict]) -> list[str]:
-        label     = obj.get("label", "")
-        dist      = obj.get("dist")
-        direction = obj.get("direction", "center")
-        motion    = obj.get("motion",    "stable")
-        risk      = obj.get("risk",      0.0)
+    # ── Логика принятия решений ────────────────────────────────────────────────
 
-        if dist is None:
-            return []
+    def _decide(self, all_objects: list[dict], top: dict | None, now: float) -> str | None:
 
-        # ── Высокий риск → только alert ──────────────────────────────────────
-        if risk >= HIGH_RISK_SCORE:
-            if dist <= 1.5:
-                alert = _p(label, "alert", "very_close.wav") \
-                     or _p("alerts", "very_close.wav")
+        # ── Приоритет 1: НЕМЕДЛЕННАЯ ОПАСНОСТЬ — очень близко ────────────────
+        very_close = self._find(all_objects,
+            lambda o: o.get("dist", 99) <= VERY_CLOSE_M
+        )
+        if very_close:
+            return S.STOP or S.VERY_CLOSE
+
+        # ── Приоритет 2: ТРАНСПОРТ приближается ──────────────────────────────
+        danger = self._find(all_objects,
+            lambda o: (
+                o.get("label") in TRANSPORT
+                and o.get("motion") == "approaching"
+                and o.get("dist", 99) <= DANGER_DIST_M
+            )
+        )
+        if danger:
+            # Если по центру → предложить обход, иначе просто сигнал
+            if danger.get("direction") == "center":
+                free = self._free_side(all_objects)
+                return free or S.NO_WAY or S.OBSTACLE
             else:
-                alert = _p(label, "alert", "danger.wav") \
-                     or _p("alerts", "danger.wav")
-            return [alert] if alert else []
+                return S.OBSTACLE
 
-        # ── Навигация: центр + близко ─────────────────────────────────────────
-        if direction == "center" and dist <= NAV_DIST_M:
-            nav = self._nav_sound(all_objects)
-            if nav:
-                obstacle = _p("navigation", "obstacle.wav")
-                return [p for p in [obstacle, nav] if p]
+        # ── Приоритет 3: ЧЕЛОВЕК по центру + приближается ────────────────────
+        person_center = self._find(all_objects,
+            lambda o: (
+                o.get("label") == "person"
+                and o.get("direction") == "center"
+                and o.get("motion") == "approaching"
+                and o.get("dist", 99) <= PERSON_DIST_M
+            )
+        )
+        if person_center:
+            return S.PERSON_AHEAD or S.OBSTACLE
 
-        # ── Стандартная последовательность ───────────────────────────────────
-        # direction → dist → motion
-        seq = []
+        # ── Приоритет 4: ЛЮБОЙ объект по центру + близко ─────────────────────
+        center_obj = self._find(all_objects,
+            lambda o: (
+                o.get("direction") == "center"
+                and o.get("dist", 99) <= NAV_DIST_M
+                and o.get("label") in OBSTACLES
+            )
+        )
+        if center_obj:
+            free = self._free_side(all_objects)
+            return free or S.NO_WAY
 
-        dir_sound = _p(label, "direction", f"{direction}.wav")
-        if not dir_sound:
-            dir_sound = _p("person", "direction", f"{direction}.wav")  # fallback
-        if dir_sound:
-            seq.append(dir_sound)
+        # ── Приоритет 5: ПУТЬ СВОБОДЕН → go (не чаще GO_INTERVAL) ───────────
+        if (now - self._last_go) >= GO_INTERVAL:
+            center_blocked = any(
+                o.get("direction") == "center" and o.get("dist", 99) <= NAV_DIST_M
+                for o in all_objects
+            )
+            if not center_blocked:
+                return S.GO
 
-        dist_sound = _dist_file(label, dist)
-        if not dist_sound:
-            dist_sound = _dist_file("person", dist)  # fallback
-        if dist_sound:
-            seq.append(dist_sound)
+        return None
 
-        motion_sound = _p(label, "motion", f"{motion}.wav")
-        if not motion_sound:
-            motion_sound = _p("person", "motion", f"{motion}.wav")  # fallback
-        if motion_sound:
-            seq.append(motion_sound)
+    # ── Вспомогательные ───────────────────────────────────────────────────────
 
-        return seq
+    @staticmethod
+    def _find(objects: list[dict], condition) -> dict | None:
+        """Возвращает первый объект удовлетворяющий условию (по убыванию risk)."""
+        candidates = [o for o in objects if condition(o)]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda o: o.get("risk", 0))
 
-    def _nav_sound(self, all_objects: list[dict]) -> str | None:
-        """Выбирает свободную сторону и возвращает go_left / go_right."""
-        occupied = {o.get("direction") for o in all_objects}
+    @staticmethod
+    def _free_side(objects: list[dict]) -> str | None:
+        """Возвращает звук для свободной стороны (left/right)."""
+        occupied = {o.get("direction") for o in objects}
         if "left" not in occupied:
-            return _p("navigation", "go_left.wav")
+            return S.LEFT
         if "right" not in occupied:
-            return _p("navigation", "go_right.wav")
-        return _p("navigation", "go_straight.wav")
+            return S.RIGHT
+        return None
